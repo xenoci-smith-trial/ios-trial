@@ -2,7 +2,7 @@ name: iOS CI
 on: [push, pull_request]
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
