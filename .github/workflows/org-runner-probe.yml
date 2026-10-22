@@ -1,0 +1,13 @@
+name: org-runner probe
+# org-runner 2026-10-23: dev measurement of organization JIT runners across two repositories (manual only).
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: xenoci-macos
+    timeout-minutes: 10
+    steps:
+      - run: |
+          echo "repo=$GITHUB_REPOSITORY runner=$RUNNER_NAME run=$GITHUB_RUN_ID"
+          sleep 45
+          echo XENOCI_ORG_RUNNER_PROBE_PASS
