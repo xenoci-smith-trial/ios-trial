@@ -1,0 +1,14 @@
+name: XenoCI dev Sticky Disk
+description: Attach a job-owned APFS clone and commit it after a successful job (dev QA only).
+inputs:
+  key:
+    description: Repository-scoped persistent disk key
+    required: true
+  path:
+    description: Mount path (relative to workspace or absolute; supports ~/)
+    required: true
+runs:
+  using: node24
+  main: index.mjs
+  post: index.mjs
+  post-if: always()

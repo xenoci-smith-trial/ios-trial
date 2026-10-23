@@ -1,0 +1,59 @@
+name: XenoCI sticky disk actual APFS proof
+run-name: xnas-sticky-${{ github.run_id }}
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: xnas-sticky-proof
+  cancel-in-progress: false
+jobs:
+  first:
+    runs-on: xenoci-macos
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm actual Mac
+        run: |
+          test "$(uname -s)" = Darwin
+          hostname
+          sw_vers
+      - uses: ./integrations/stickydisk
+        with:
+          key: xnas-sticky-proof
+          path: ${{ runner.temp }}/xnas-sticky-proof
+      - name: Write first-job marker on APFS
+        env:
+          DISK_PATH: ${{ runner.temp }}/xnas-sticky-proof
+          NONCE: xnas-sticky-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          diskutil info "$DISK_PATH" | tee "$RUNNER_TEMP/xnas-first-diskutil.txt"
+          grep -q APFS "$RUNNER_TEMP/xnas-first-diskutil.txt"
+          printf '%s\n' "$NONCE" > "$DISK_PATH/marker.txt"
+          shasum -a 256 "$DISK_PATH/marker.txt"
+          echo XENOCI_STICKY_FIRST_JOB_WRITTEN
+  second:
+    needs: first
+    runs-on: xenoci-macos
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm actual Mac
+        run: |
+          test "$(uname -s)" = Darwin
+          hostname
+          sw_vers
+      - uses: ./integrations/stickydisk
+        with:
+          key: xnas-sticky-proof
+          path: ${{ runner.temp }}/xnas-sticky-proof
+      - name: Read first-job marker from the next APFS clone
+        env:
+          DISK_PATH: ${{ runner.temp }}/xnas-sticky-proof
+          NONCE: xnas-sticky-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          diskutil info "$DISK_PATH" | tee "$RUNNER_TEMP/xnas-second-diskutil.txt"
+          grep -q APFS "$RUNNER_TEMP/xnas-second-diskutil.txt"
+          test "$(cat "$DISK_PATH/marker.txt")" = "$NONCE"
+          shasum -a 256 "$DISK_PATH/marker.txt"
+          echo XENOCI_STICKY_SECOND_JOB_PERSISTENCE_PASS
