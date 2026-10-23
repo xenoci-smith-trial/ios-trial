@@ -88,10 +88,14 @@ export function createMacStickyJobRuntime({ origin, orgPublicId, capability, job
   const transport = gateway ? new URL(gateway) : base;
   if (gateway && transport.href !== 'http://artifacts.ci.xeno/') throw new Error('invalid internal cache gateway');
   const requestUrl = (url) => new URL(url.pathname + url.search, transport);
+  // Through the office pin the node serves several consoles (production, dev): name the one this job belongs to so the
+  // gateway relays there (artifact-gateway.js CACHE_ORIGIN_HEADER, sticky-devlease 2026-10-24). Direct calls need none.
+  const viaHeaders = (url, headers = {}) => (gateway && url.origin === transport.origin ? { ...headers, 'x-xeno-cache-origin': base.origin } : headers);
   const endpoint = `/api/runner/v1/organizations/${encodeURIComponent(orgPublicId)}/cache/leases`;
   const api = async (route, body) => {
-    const response = await fetchImpl(requestUrl(new URL(route, base)), { method: 'POST', redirect: 'error',
-      headers: { Authorization: `Bearer ${capability}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const url = requestUrl(new URL(route, base));
+    const response = await fetchImpl(url, { method: 'POST', redirect: 'error',
+      headers: viaHeaders(url, { Authorization: `Bearer ${capability}`, 'Content-Type': 'application/json' }), body: JSON.stringify(body) });
     if (!response.ok) { const e = await response.json(); throw Object.assign(new Error(e.error?.code ?? 'cache_http_error'), { status: response.status }); }
     return (await response.json()).data;
   };
@@ -123,7 +127,8 @@ export function createMacStickyJobRuntime({ origin, orgPublicId, capability, job
       if (lease.generation > 0 && lease.read_url) {
         const started = Date.now();
         try {
-          const response = await fetchImpl(signedUrl(lease.read_url), { redirect: 'error' });
+          const readUrl = signedUrl(lease.read_url);
+          const response = await fetchImpl(readUrl, { redirect: 'error', headers: viaHeaders(readUrl) });
           if (!response.ok || Number(response.headers.get('content-length')) > maxBytes * 2) { await response.body?.cancel(); throw new Error(`cache image download ${response.status}`); }
           await pipeline(response.body, createWriteStream(archive, { flags: 'wx', mode: 0o600 }));
           const receipt = await digestFile(archive);
@@ -152,8 +157,9 @@ export function createMacStickyJobRuntime({ origin, orgPublicId, capability, job
     try {
       const receipt = await packMacCacheImage(published.path, archive);
       if (receipt.bytes > job.maxBytes) throw new Error('cache image exceeds reserved capacity');
-      const response = await fetchImpl(signedUrl(job.lease.write_url), { method: 'PUT', redirect: 'error', body: createReadStream(archive), duplex: 'half',
-        headers: { 'content-length': String(receipt.bytes) } });
+      const writeUrl = signedUrl(job.lease.write_url);
+      const response = await fetchImpl(writeUrl, { method: 'PUT', redirect: 'error', body: createReadStream(archive), duplex: 'half',
+        headers: viaHeaders(writeUrl, { 'content-length': String(receipt.bytes) }) });
       if (!response.ok) throw new Error(`cache image upload failed ${response.status}`);
       return await api(`${endpoint}/${encodeURIComponent(job.lease.lease_id)}/commit`, { generation: job.lease.generation, ...receipt });
     } finally { await fs.rm(archive, { force: true }); }
