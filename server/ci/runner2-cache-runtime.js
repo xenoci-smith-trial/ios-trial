@@ -4,7 +4,29 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
 import { pipeline } from 'node:stream/promises';
+import http from 'node:http';
+import https from 'node:https';
+import { Readable } from 'node:stream';
 import { createMacCacheAdapter } from './runner2-cache-mac.js';
+
+/**
+ * GET for the stored image through node:http/https rather than fetch (the gateway pin and sticky.ci.xeno are http://,
+ * a direct control-plane blob is https://). Node 24's bundled undici aborts the whole process with an uncatchable
+ * `assert(!this.paused)` when a large body is still being written to disk and the server closes the socket
+ * (nodejs/undici#5360); the NAS node always sends
+ * `Connection: close` (nas-sendfile.js), so a sticky restore crashed the action with an internal stack (prod run
+ * 40081811049, sticky-grace 2026-10-24). node:http honours the runner's proxy under --use-env-proxy like fetch does.
+ */
+export function httpGetResponse(url, { headers = {} } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = (new URL(url).protocol === 'https:' ? https : http).get(url, { headers }, (res) => {
+      const out = new Headers();
+      for (const [k, v] of Object.entries(res.headers)) if (v != null) out.set(k, Array.isArray(v) ? v.join(', ') : String(v));
+      resolve(new Response([204, 304].includes(res.statusCode) ? (res.resume(), null) : Readable.toWeb(res), { status: res.statusCode, headers: out }));
+    });
+    req.once('error', reject);
+  });
+}
 
 const fileName = /^(?:Info\.plist|Info\.bckup|token|bands\/[a-f0-9]+)$/;
 const digestFile = async (name) => {
@@ -82,7 +104,8 @@ export async function restoreMacCacheImage(archive, target, maxBytes) {
 
 /** Concrete per-job Mac bridge. S00 runs it only inside the owned guest/runner runtime after S05 serialization. */
 export function createMacStickyJobRuntime({ origin, orgPublicId, capability, jobPublicId, repo, ref, root,
-  gateway = null, fetchImpl = fetch, guestLocal = false, adapter = createMacCacheAdapter({ root, guestLocal }), log = () => {} }) {
+  gateway = null, fetchImpl = fetch, downloadImpl = fetchImpl === fetch ? httpGetResponse : fetchImpl, guestLocal = false,
+  adapter = createMacCacheAdapter({ root, guestLocal }), log = () => {} }) {
   const base = new URL(origin);
   if (base.protocol !== 'https:' || base.username || base.password || !path.isAbsolute(root)) throw new Error('invalid cache runtime configuration');
   const transport = gateway ? new URL(gateway) : base;
@@ -112,10 +135,12 @@ export function createMacStickyJobRuntime({ origin, orgPublicId, capability, job
   const begin = async ({ key, maxBytes, mode = 'write', kind = 'sticky' }) => {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 32 * 1024 ** 2) throw new Error('invalid cache image capacity');
     // A disk in its unpaid grace refuses writers with 402; the job still gets its data read-only and commits nothing.
+    // readOnly names why, so the action can tell the customer in one line (sticky-grace 2026-10-24).
     const request = (m) => api(endpoint, { kind, repo, key, ref, mode: m, job_id: jobPublicId });
+    let readOnly = null;
     const lease = await request(mode).catch((error) => {
       if (mode !== 'write' || error.status !== 402) throw error;
-      mode = 'read'; return request('read');
+      mode = 'read'; readOnly = error.message; return request('read');
     });
     const localId = `disk_${crypto.createHash('sha256').update(`${orgPublicId}\0${repo}\0${kind === 'sticky' ? '' : `${kind}\0`}${key}`).digest('hex')}`;
     await fs.mkdir(root, { recursive: true, mode: 0o700 });
@@ -128,7 +153,7 @@ export function createMacStickyJobRuntime({ origin, orgPublicId, capability, job
         const started = Date.now();
         try {
           const readUrl = signedUrl(lease.read_url);
-          const response = await fetchImpl(readUrl, { redirect: 'error', headers: viaHeaders(readUrl) });
+          const response = await downloadImpl(readUrl, { redirect: 'error', headers: viaHeaders(readUrl) });
           if (!response.ok || Number(response.headers.get('content-length')) > maxBytes * 2) { await response.body?.cancel(); throw new Error(`cache image download ${response.status}`); }
           await pipeline(response.body, createWriteStream(archive, { flags: 'wx', mode: 0o600 }));
           const receipt = await digestFile(archive);
@@ -142,7 +167,7 @@ export function createMacStickyJobRuntime({ origin, orgPublicId, capability, job
       }
       if (!restored) await adapter.create({ diskId: localId, maxBytes, generation: lease.generation });
       const mounted = await adapter.attach({ diskId: localId, generation: lease.generation, leaseId: lease.lease_id, mode });
-      return { lease, mounted, maxBytes, localId, restored, source, downloadMs, downloadBytes };
+      return { lease, mounted, maxBytes, localId, restored, source, downloadMs, downloadBytes, readOnly };
     } catch (error) {
       await api(`${endpoint}/${encodeURIComponent(lease.lease_id)}/release`, {});
       // The adapter refuses removal if attach partly succeeded and a mount is still active.
