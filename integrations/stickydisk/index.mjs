@@ -1,41 +1,4 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import os from 'node:os';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
-import { createMacStickyJobRuntime } from '../../server/ci/runner2-cache-runtime.js';
 
-const env = process.env;
-// Same wording as server/ci/runner2-sticky-disks.js STICKY_ROOM_MESSAGES (the action runs on the guest without the server tree).
-const ROOM = { sticky_capacity_full: '지금은 스티키 디스크 자리가 없어요. 이번 잡은 스티키 디스크 없이 진행돼요',
-  sticky_org_full: '조직의 스티키 디스크가 최대 용량에 이르렀어요. 이번 잡은 스티키 디스크 없이 진행돼요' };
-// A disk in its unpaid grace (402 insufficient_credit on the write lease): the job still mounts it read-only (sticky-grace 2026-10-24).
-const READ_ONLY = { insufficient_credit: '잔액이 없어 스티키 디스크가 읽기 전용입니다, 충전하면 다시 쓸 수 있어요' };
-// Native fetch does not use the runner's mandatory egress proxy unless Node opts in at startup.
-if ((env.HTTPS_PROXY || env.https_proxy) && !process.execArgv.includes('--use-env-proxy')) {
-  const child = spawn(process.execPath, ['--use-env-proxy', ...process.execArgv, ...process.argv.slice(1)], { env, stdio: 'inherit' });
-  const [code] = await once(child, 'close');
-  process.exit(code ?? 1);
-}
-try {
-  if (env.STATE_XENOCI_STICKY_STARTED && !env.STATE_XENOCI_STICKY_STATE) process.exit(0);
-  const config = JSON.parse(env.XENOCI_STICKY_CONFIG ?? 'null');
-  if (!config || !/^https:\/\/[^/]+$/.test(config.origin ?? '') || !env.XENOCI_CACHE_JOB_CAPABILITY) throw new Error('Sticky disks require a XenoCI runner');
-  // The runner's cache probe (runner2-github-jobs.js cacheShell) chose the office pin when the origin was not reachable
-  // directly: the disk control calls then go through the same pin.
-  if (!config.gateway) {
-    const verdict = await fs.readFile(path.join(os.homedir(), '.xenoci-results-url'), 'utf8').catch(() => '');
-    if (verdict.trim() === 'http://artifacts.ci.xeno/') config.gateway = 'http://artifacts.ci.xeno/';
-  }
-  console.log(`::add-mask::${env.XENOCI_CACHE_JOB_CAPABILITY}`);
-  const stateFile = env.STATE_XENOCI_STICKY_STATE;
-  if (stateFile) {
-    const { job, mountPath, config: savedConfig } = JSON.parse(await fs.readFile(stateFile, 'utf8'));
-    const runtime = createMacStickyJobRuntime({ ...savedConfig, capability: env.XENOCI_CACHE_JOB_CAPABILITY });
-    // This image is mounted inside the ephemeral guest, not attached to a live guest from its host.
-    // The runner invokes the post hook after workflow steps stop writing; detach must succeed before upload.
-    // Free trial terms (sticky-nas 2026-10-19): a failed save is a warning, the next build starts from the last saved disk.
-    let receipt = { committed: false };
     try { receipt = await runtime.finish(job, { succeeded: true, jobCompleted: true }); }
     catch (error) {
       // No room (sticky-sell 2026-10-21): the disk keeps its last saved generation; the job is not failed.
@@ -82,7 +45,6 @@ try {
     const state = path.join(root, 'state.json');
     await fs.writeFile(state, JSON.stringify({ job, mountPath, config: runtimeConfig }), { mode: 0o600 });
     await fs.appendFile(env.GITHUB_STATE, `XENOCI_STICKY_STATE=${state}\n`);
-    if (job.readOnly) console.log(`::notice::${READ_ONLY[job.readOnly] ?? READ_ONLY.insufficient_credit}`);
     console.log(`XENOCI_STICKY_MOUNTED generation=${job.lease.generation} filesystem=APFS mode=${job.mounted.mode} restored=${job.restored} source=${job.source} bytes=${job.downloadBytes} download_ms=${job.downloadMs}`);
   }
 } catch (error) {
