@@ -1,0 +1,78 @@
+name: cpu-vs-bs-1120
+run-name: cpu-${{ inputs.probe }}
+# CPU-only comparison: same commands, same vCPU size, xenoci-Nvcpu vs blacksmith-Nvcpu.
+# Results are printed as "RES <name> <rep> <value>" lines in the job log. Manual dispatch only.
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        default: '["blacksmith-2vcpu-ubuntu-2404","xenoci-2vcpu-ubuntu-2404","blacksmith-4vcpu-ubuntu-2404","xenoci-4vcpu-ubuntu-2404","blacksmith-8vcpu-ubuntu-2404","xenoci-8vcpu-ubuntu-2404"]'
+      probe:
+        required: true
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+jobs:
+  cpu:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners) }}
+    steps:
+      - name: cpu info
+        run: |
+          nproc; free -g | head -2; uname -r
+          lscpu
+          grep -E 'model name|cpu MHz|cache size' /proc/cpuinfo | sort | uniq -c
+          echo "RES model 0 $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs | tr ' ' '_')"
+          echo "RES nproc 0 $(nproc)"
+      - name: tools
+        run: |
+          command -v 7z >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq 7zip >/dev/null || sudo apt-get install -y -qq p7zip-full >/dev/null; }
+          command -v 7z || command -v 7zz
+          openssl version
+      - name: single core
+        run: |
+          Z=$(command -v 7z || command -v 7zz)
+          for k in 1 2 3; do
+            v=$(openssl speed -seconds 5 -evp sha256 2>/dev/null | awk '/^sha256/{print $NF}' | tr -d k)
+            echo "RES openssl_sha256_16k_kBps $k $v"
+            v=$($Z b -mmt1 | awk '/^Tot:/{print $NF}')
+            echo "RES 7z_mmt1_tot_mips $k $v"
+          done
+      - name: all cores
+        run: |
+          Z=$(command -v 7z || command -v 7zz)
+          for k in 1 2 3; do
+            v=$($Z b | awk '/^Tot:/{print $NF}')
+            echo "RES 7z_all_tot_mips $k $v"
+          done
+      - name: checkout ripgrep
+        uses: actions/checkout@v4
+        with:
+          repository: BurntSushi/ripgrep
+          ref: 0e8390a66fbcf6eeac1aeb0541b367663a597c79
+          path: rg
+      - name: rust toolchain
+        run: |
+          if command -v rustup >/dev/null; then
+            rustup toolchain install 1.82.0 --profile minimal && rustup default 1.82.0
+          else
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.82.0
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: cargo build (3x, clean, no cache)
+        working-directory: rg
+        run: |
+          export RUSTC_WRAPPER= SCCACHE_DISABLE=1
+          cargo fetch --locked
+          for k in 1 2 3; do
+            rm -rf target
+            s=$(date +%s.%N); cargo build --release --locked --offline -q; e=$(date +%s.%N)
+            echo "RES cargo_release_s $k $(awk -v s=$s -v e=$e 'BEGIN{printf "%.1f", e-s}')"
+          done
