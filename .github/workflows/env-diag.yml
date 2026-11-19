@@ -1,0 +1,14 @@
+name: env-diag
+on: workflow_dispatch
+jobs:
+  diag:
+    runs-on: xenoci-4vcpu-ubuntu-2404
+    steps:
+      - run: |
+          set -x
+          id; echo HOME=$HOME; git --version
+          git config --system -l || true
+          git config --global -l || true
+          git config --get-regexp '^(filter\.|merge\..*\.driver$)' || true
+          ls -la /run/xenoci-image-cache 2>&1 | head
+          sudo -n true && echo SUDO_OK
