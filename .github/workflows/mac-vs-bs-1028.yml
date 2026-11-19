@@ -77,7 +77,7 @@ jobs:
           persist-credentials: false
       - name: sticky disk (spm+derived)
         if: ${{ inputs.mode == 'sticky' }}
-        uses: Xeno-CI/actions/stickydisk@main
+        uses: Xeno-CI/actions/stickydisk@e2cedc9aa291ac81cd1beaa02131b84bd6e33746
         with:
           key: mvb-ios
           path: ${{ env.W }}
