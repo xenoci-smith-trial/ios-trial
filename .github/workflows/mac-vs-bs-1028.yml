@@ -1,0 +1,141 @@
+name: mac-vs-bs-1028
+run-name: mvb-${{ inputs.runner }}-${{ inputs.mode }}-${{ inputs.probe }}
+# mac-2x (2026-10-28): the same iOS workload on any macOS runner label.
+# IceCubesApp b2db3033: SwiftPM resolve, app build for iOS Simulator, ModelsTests on a booted iPhone simulator.
+# mode=cold: no cache restore (cache is still saved so later warm runs can restore).
+# mode=warm: actions/cache restore of SwiftPM checkouts + DerivedData for this runner label, then save.
+# Manual dispatch only. Measurement data comes from the GitHub jobs API (queued/started/completed + steps).
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: blacksmith-6vcpu-macos-26 | xenoci-macos | macos-26
+        required: true
+      mode:
+        description: cold, warm (actions/cache) or sticky (Xeno-CI sticky disk, xenoci-macos only)
+        required: true
+        default: cold
+      probe:
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: mvb-${{ inputs.runner }}
+  cancel-in-progress: false
+env:
+  W: ${{ github.workspace }}/mvb
+jobs:
+  ios:
+    name: ios
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: host info
+        shell: bash
+        run: |
+          sysctl -n hw.model hw.ncpu hw.memsize machdep.cpu.brand_string || true
+          sw_vers -productVersion; df -h / | tail -1
+          ls -d /Applications/Xcode*.app || true
+      - name: select xcode
+        shell: bash
+        run: |
+          xcrun simctl list runtimes || true
+          RT=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys
+          r=[x["version"] for x in json.load(sys.stdin)["runtimes"] if x.get("isAvailable") and x["platform"]=="iOS" and x["version"].startswith("26.")]
+          r.sort(key=lambda v:[int(n) for n in v.split(".")])
+          print(r[-1] if r else "")')
+          XC=""
+          for c in /Applications/Xcode_26.6.app /Applications/Xcode-26.6.app /Applications/Xcode_26.6*.app; do
+            [ -d "$c" ] && xcrun simctl list runtimes | grep -q 'iOS 26\.6' && { XC=$c; break; }
+          done
+          DEST='generic/platform=iOS Simulator'
+          if [ -z "$XC" ]; then
+            MM=$(echo "$RT" | cut -d. -f1-2)
+            for c in /Applications/Xcode_${MM}.app /Applications/Xcode-${MM}.app /Applications/Xcode_${MM}*.app /Applications/Xcode-${MM}*.app; do
+              [ -d "$c" ] && { XC=$c; break; }
+            done
+          fi
+          if [ -z "$XC" ]; then
+            XC=$(ls -d /Applications/Xcode_26.*.app /Applications/Xcode-26.*.app 2>/dev/null | sort -V | tail -1 || true)
+            U=$(xcrun simctl list devices available -j | RT="$RT" python3 -c 'import json,sys,os
+          d=json.load(sys.stdin)["devices"]; k="com.apple.CoreSimulator.SimRuntime.iOS-"+os.environ["RT"].replace(".","-")
+          print(next((x["udid"] for x in d.get(k,[]) if x["name"].startswith("iPhone")),""))')
+            DEST="id=$U"
+            echo "fallback: no Xcode for runtime $RT, newest Xcode 26.x with that runtime's device"
+          fi
+          echo "DEST=$DEST" >> "$GITHUB_ENV"
+          echo "runtime=$RT xcode=$XC dest=$DEST"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$XC/Contents/Developer" xcodebuild -version
+          DEVELOPER_DIR="$XC/Contents/Developer" xcodebuild -showsdks | grep -i simulator || true
+      - name: checkout IceCubesApp
+        uses: actions/checkout@v4
+        with:
+          repository: Dimillian/IceCubesApp
+          ref: b2db3033fbf67a97b54d25d6dac2df8a029b26b1
+          path: app
+          persist-credentials: false
+      - name: sticky disk (spm+derived)
+        if: ${{ inputs.mode == 'sticky' }}
+        uses: Xeno-CI/build/stickydisk@v1.7.13
+        with:
+          key: mvb-ios
+          path: ${{ env.W }}
+      - name: cache restore (spm+derived)
+        if: ${{ inputs.mode == 'warm' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.W }}/spm
+            ${{ env.W }}/dd
+          key: mvb-${{ inputs.runner }}-${{ github.run_id }}
+          restore-keys: mvb-${{ inputs.runner }}-
+      - name: spm resolve
+        shell: bash
+        working-directory: app
+        run: |
+          set -euo pipefail
+          printf 'DEVELOPMENT_TEAM =\nBUNDLE_ID_PREFIX = com.xenoci.bench\n' > IceCubesApp.xcconfig
+          xcodebuild -resolvePackageDependencies -project IceCubesApp.xcodeproj -scheme IceCubesApp \
+            -clonedSourcePackagesDirPath "$W/spm" -derivedDataPath "$W/dd" -scmProvider system > "$RUNNER_TEMP/resolve.log" 2>&1 || { tail -40 "$RUNNER_TEMP/resolve.log"; exit 1; }
+          tail -3 "$RUNNER_TEMP/resolve.log"
+      - name: xcodebuild app (simulator)
+        shell: bash
+        working-directory: app
+        run: |
+          set -euo pipefail
+          xcodebuild build -project IceCubesApp.xcodeproj -scheme IceCubesApp -configuration Debug \
+            -destination "$DEST" ARCHS=arm64 \
+            -clonedSourcePackagesDirPath "$W/spm" -derivedDataPath "$W/dd" \
+            -disableAutomaticPackageResolution -scmProvider system \
+            CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO > "$RUNNER_TEMP/build.log" 2>&1 || { grep -E "error:|warning: .*macro|BUILD FAILED" "$RUNNER_TEMP/build.log" | head -40; tail -20 "$RUNNER_TEMP/build.log"; exit 1; }
+          tail -3 "$RUNNER_TEMP/build.log"
+      - name: simulator boot
+        shell: bash
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys
+          d=json.load(sys.stdin)["devices"]
+          c=[(k,x) for k,v in d.items() if "iOS" in k for x in v if x["name"].startswith("iPhone")]
+          c.sort(key=lambda p:[int(n) for n in p[0].split("iOS-")[-1].split("-")])
+          print(c[-1][1]["udid"])')
+          xcrun simctl list devices | grep "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          echo "SIM=$UDID" >> "$GITHUB_ENV"
+      - name: xcodebuild test (ModelsTests)
+        shell: bash
+        working-directory: app/Packages/Models
+        run: |
+          set -euo pipefail
+          xcodebuild test -scheme ModelsTests -destination "id=$SIM" \
+            -clonedSourcePackagesDirPath "$W/spm" -derivedDataPath "$W/dd" -scmProvider system \
+            CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO > "$RUNNER_TEMP/test.log" 2>&1 || { grep -E "error:|failed|BUILD FAILED" "$RUNNER_TEMP/test.log" | head -40; tail -20 "$RUNNER_TEMP/test.log"; exit 1; }
+          grep -E 'Executed|Test run with|TEST SUCCEEDED' "$RUNNER_TEMP/test.log" | tail -4
+      - name: cache save (spm+derived)
+        if: ${{ inputs.mode != 'sticky' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.W }}/spm
+            ${{ env.W }}/dd
+          key: mvb-${{ inputs.runner }}-${{ github.run_id }}
