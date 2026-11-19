@@ -1,0 +1,125 @@
+name: auto-cache-1101
+run-name: acx-${{ inputs.runner }}-${{ inputs.mode }}-${{ inputs.probe }}
+# auto-cache-1101 (mkt-metrics): lx-vs-bs-1027 with every actions/cache step removed; caching left to the runner.
+# mode is only a label (first / again); the workflow is identical for both.
+# Manual dispatch only. Measurement data comes from the GitHub jobs API (queued/started/completed + steps).
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: blacksmith-2vcpu-ubuntu-2404 | xenoci-2vcpu-ubuntu-2404 | ubuntu-24.04
+        required: true
+      mode:
+        description: cold or warm
+        required: true
+        default: cold
+      kinds:
+        default: '["node","rust","docker"]'
+      probe:
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: acx-${{ inputs.runner }}
+  cancel-in-progress: false
+env:
+  DOCKER_BUILD_SUMMARY: "false"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+  PUPPETEER_SKIP_DOWNLOAD: "1"
+  CARGO_TERM_COLOR: never
+jobs:
+  bench:
+    name: ${{ matrix.kind }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: ${{ fromJSON(inputs.kinds) }}
+    steps:
+      - name: host info
+        run: |
+          nproc; free -g | head -2; uname -r
+          grep -m1 'model name' /proc/cpuinfo || true
+          df -h / | tail -1
+      # ---------- node: axios v1.7.9, npm ci + build + mocha unit tests ----------
+      - name: checkout axios
+        if: ${{ matrix.kind == 'node' }}
+        uses: actions/checkout@v4
+        with:
+          repository: axios/axios
+          ref: eb5756aa6b2a68527e323726fbf472e6f6bfcbb1
+          path: axios
+      - uses: actions/setup-node@v4
+        if: ${{ matrix.kind == 'node' }}
+        with:
+          node-version: 22
+      - name: npm ci
+        if: ${{ matrix.kind == 'node' }}
+        working-directory: axios
+        run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: npm build
+        if: ${{ matrix.kind == 'node' }}
+        working-directory: axios
+        run: npm run build
+      - name: npm test (mocha unit)
+        if: ${{ matrix.kind == 'node' }}
+        working-directory: axios
+        continue-on-error: true
+        run: npm run test:mocha
+      # ---------- rust: ripgrep 14.1.1 cargo build --release ----------
+      - name: checkout ripgrep
+        if: ${{ matrix.kind == 'rust' }}
+        uses: actions/checkout@v4
+        with:
+          repository: BurntSushi/ripgrep
+          ref: 0e8390a66fbcf6eeac1aeb0541b367663a597c79
+          path: rg
+      - name: rust toolchain
+        if: ${{ matrix.kind == 'rust' }}
+        run: |
+          if command -v rustup >/dev/null; then
+            rustup toolchain install 1.82.0 --profile minimal && rustup default 1.82.0
+          else
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.82.0
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
+      - name: cargo build --release
+        if: ${{ matrix.kind == 'rust' }}
+        working-directory: rg
+        run: cargo build --release --locked
+      - name: rg version
+        if: ${{ matrix.kind == 'rust' }}
+        working-directory: rg
+        run: ./target/release/rg --version
+      # ---------- docker: small two-stage Dockerfile, default buildx builder, no cache options ----------
+      - name: dockerfile
+        if: ${{ matrix.kind == 'docker' }}
+        run: |
+          mkdir -p dctx && cd dctx
+          cat > Dockerfile <<'EOF'
+          FROM golang:1.23-bookworm AS build
+          WORKDIR /src
+          RUN git clone --depth 1 -b v1.3.0 https://github.com/spf13/cobra-cli.git . && CGO_ENABLED=0 go build -o /out/cobra-cli .
+          FROM ubuntu:24.04
+          RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git python3 >/dev/null && rm -rf /var/lib/apt/lists/*
+          COPY --from=build /out/cobra-cli /usr/local/bin/cobra-cli
+          CMD ["cobra-cli","--help"]
+          EOF
+      - uses: docker/setup-buildx-action@v3
+        if: ${{ matrix.kind == 'docker' }}
+        id: bx
+      - name: docker build
+        if: ${{ matrix.kind == 'docker' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: dctx
+          builder: ${{ steps.bx.outputs.name }}
+          push: false
+          load: true
+          tags: lvb:ci
+      - name: docker run
+        if: ${{ matrix.kind == 'docker' }}
+        run: |
+          docker run --rm lvb:ci | head -3
