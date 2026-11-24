@@ -1,0 +1,60 @@
+name: xsoak-x266
+# prod-live-soak-1124: 운영 runner.xenoci.com 상시 실측 잡. 투입은 디스패처(workflow_dispatch)만.
+# Xcode 26.6 요청 판(서버는 파일의 DEVELOPER_DIR 고정값으로 요청 Xcode 를 읽는다).
+# kind: short(sleep N분) | swift(SwiftPM 패키지 실제 빌드·시험) | ios(iOS 시뮬레이터 앱 빌드) | cache(brew·npm·SPM 내려받기 많이)
+run-name: xsoak-x266-${{ inputs.kind }}-${{ inputs.minutes }}m
+on:
+  workflow_dispatch:
+    inputs:
+      kind: { description: short|swift|ios|cache, default: short }
+      minutes: { description: 잡 최소 길이(분), default: "2" }
+jobs:
+  mac:
+    runs-on: xenoci-macos
+    timeout-minutes: 75
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: info
+        run: |
+          echo "XSOAK kind=${{ inputs.kind }} min=${{ inputs.minutes }} host=$(hostname)"
+          sw_vers; xcodebuild -version | head -2 || true
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          df -h / | tail -1
+          echo "XSOAK_START $(date +%s)"
+      - name: swift
+        if: inputs.kind == 'swift'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"; rm -rf sa; git clone --depth 1 https://github.com/apple/swift-argument-parser sa
+          cd sa; swift build -c debug 2>&1 | tail -5; swift test 2>&1 | tail -5
+      - name: ios
+        if: inputs.kind == 'ios'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"; rm -rf ice
+          curl -fsSL -o src.tgz https://github.com/Dimillian/IceCubesApp/archive/b2db3033fbf67a97b54d25d6dac2df8a029b26b1.tar.gz
+          mkdir ice; tar xzf src.tgz -C ice --strip-components 1; cd ice
+          printf 'DEVELOPMENT_TEAM =\nBUNDLE_ID_PREFIX = im.cicd.xsoak\n' > IceCubesApp.xcconfig
+          xcodebuild build -scheme IceCubesApp -project IceCubesApp.xcodeproj -derivedDataPath "$RUNNER_TEMP/dd" \
+            -destination 'generic/platform=iOS Simulator' -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO > "$RUNNER_TEMP/build.log" 2>&1 || { tail -40 "$RUNNER_TEMP/build.log"; exit 1; }
+          tail -3 "$RUNNER_TEMP/build.log"
+      - name: cache
+        if: inputs.kind == 'cache'
+        run: |
+          set -euo pipefail
+          brew install --quiet jq ripgrep fd 2>&1 | tail -3 || true
+          cd "$RUNNER_TEMP"; rm -rf nx; mkdir nx; cd nx; npm init -y >/dev/null
+          npm install --no-audit --no-fund typescript eslint react react-dom next@14 2>&1 | tail -3
+          cd "$RUNNER_TEMP"; rm -rf alamo; git clone --depth 1 https://github.com/Alamofire/Alamofire alamo; cd alamo; swift package resolve 2>&1 | tail -2
+      - name: hold
+        run: |
+          end=$(( $(date +%s) + ${{ inputs.minutes }} * 60 ))
+          i=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            i=$((i+1)); head -c 1048576 /dev/urandom | shasum -a 256 >/dev/null
+            [ $((i % 20)) -ne 0 ] || echo "XSOAK tick $i $(date -u +%T)"
+            sleep 3
+          done
+          echo "XSOAK done"
